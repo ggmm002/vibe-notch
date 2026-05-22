@@ -88,14 +88,19 @@ struct ClaudeInstancesView: View {
     // MARK: - Actions
 
     private func focusSession(_ session: SessionState) {
-        guard session.isInTmux else { return }
-
-        Task {
-            if let pid = session.pid {
-                _ = await YabaiController.shared.focusWindow(forClaudePid: pid)
-            } else {
-                _ = await YabaiController.shared.focusWindow(forWorkingDirectory: session.cwd)
+        Task { @MainActor in
+            // tmux + yabai gets the special path — yabai can target the pane
+            // across spaces and handle tmux window selection.
+            if session.isInTmux,
+               await WindowFinder.shared.isYabaiAvailable(),
+               let pid = session.pid,
+               await YabaiController.shared.focusWindow(forClaudePid: pid) {
+                return
             }
+
+            // Everything else (Ghostty without tmux, no yabai, etc.) uses the
+            // native Accessibility-based focuser.
+            TerminalWindowFocuser.shared.focus(session: session)
         }
     }
 
@@ -128,7 +133,6 @@ struct InstanceRow: View {
 
     @State private var isHovered = false
     @State private var spinnerPhase = 0
-    @State private var isYabaiAvailable = false
 
     private let claudeOrange = Color(red: 0.85, green: 0.47, blue: 0.34)
     private let spinnerSymbols = ["·", "✢", "✳", "∗", "✻", "✽"]
@@ -176,6 +180,19 @@ struct InstanceRow: View {
                         .font(.system(size: 13, weight: .medium))
                         .foregroundColor(.white)
                         .lineLimit(1)
+
+                    // Agent badge — only shown for non-default (Codex) agents
+                    if session.agentType != .claude {
+                        Text(session.agentType.shortName)
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(TerminalColors.blue)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .fill(TerminalColors.blue.opacity(0.15))
+                            )
+                    }
 
                     // Token usage indicator
                     if session.usage.totalTokens > 0 {
@@ -267,10 +284,11 @@ struct InstanceRow: View {
                         onChat()
                     }
 
-                    // Go to Terminal button (only if yabai available)
-                    if isYabaiAvailable {
+                    // Go to Terminal button — works for any terminal we can
+                    // resolve a PID for (Ghostty, iTerm, Terminal, Warp, …).
+                    if session.pid != nil {
                         TerminalButton(
-                            isEnabled: session.isInTmux,
+                            isEnabled: true,
                             onTap: { onFocus() }
                         )
                     }
@@ -290,8 +308,9 @@ struct InstanceRow: View {
                         onChat()
                     }
 
-                    // Focus icon (only for tmux instances with yabai)
-                    if session.isInTmux && isYabaiAvailable {
+                    // Focus icon — jump to the terminal hosting this session.
+                    // Available whenever we know the session's PID.
+                    if session.pid != nil {
                         IconButton(icon: "eye") {
                             onFocus()
                         }
@@ -320,9 +339,6 @@ struct InstanceRow: View {
                 .fill(isHovered ? Color.white.opacity(0.06) : Color.clear)
         )
         .onHover { isHovered = $0 }
-        .task {
-            isYabaiAvailable = await WindowFinder.shared.isYabaiAvailable()
-        }
     }
 
     @ViewBuilder

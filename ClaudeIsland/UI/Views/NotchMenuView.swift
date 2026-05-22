@@ -20,6 +20,7 @@ struct NotchMenuView: View {
     @ObservedObject private var soundSelector = SoundSelector.shared
     @State private var hooksInstalled: Bool = false
     @State private var launchAtLogin: Bool = false
+    @State private var codexEnabled: Bool = false
 
     var body: some View {
         // ScrollView so the menu gracefully scrolls when content exceeds the
@@ -80,6 +81,22 @@ struct NotchMenuView: View {
                     }
                 }
 
+                MenuToggleRow(
+                    icon: "cpu",
+                    label: "Monitor Codex",
+                    isOn: codexEnabled
+                ) {
+                    if codexEnabled {
+                        AppSettings.codexMonitoringEnabled = false
+                        CodexHookInstaller.uninstall()
+                        codexEnabled = false
+                    } else {
+                        AppSettings.codexMonitoringEnabled = true
+                        CodexHookInstaller.installIfNeeded()
+                        codexEnabled = true
+                    }
+                }
+
                 AccessibilityRow(isEnabled: AXIsProcessTrusted())
 
                 Divider()
@@ -127,6 +144,7 @@ struct NotchMenuView: View {
     private func refreshStates() {
         hooksInstalled = HookInstaller.isInstalled()
         launchAtLogin = SMAppService.mainApp.status == .enabled
+        codexEnabled = AppSettings.codexMonitoringEnabled
         screenSelector.refreshScreens()
     }
 }

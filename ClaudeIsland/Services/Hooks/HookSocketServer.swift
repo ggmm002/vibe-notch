@@ -25,6 +25,9 @@ struct HookEvent: Codable, Sendable {
     let toolUseId: String?
     let notificationType: String?
     let message: String?
+    /// Which agent emitted this event. Absent for Claude Code (its hook script
+    /// predates this field), so decoding to nil means `.claude`.
+    let agent: String?
 
     enum CodingKeys: String, CodingKey {
         case sessionId = "session_id"
@@ -33,10 +36,17 @@ struct HookEvent: Codable, Sendable {
         case toolUseId = "tool_use_id"
         case notificationType = "notification_type"
         case message
+        case agent
+    }
+
+    /// The agent that owns this session. Defaults to `.claude` when the hook
+    /// script didn't tag the event (every existing Claude Code install).
+    var agentType: AgentType {
+        AgentType(rawValue: agent ?? "claude") ?? .claude
     }
 
     /// Create a copy with updated toolUseId
-    init(sessionId: String, cwd: String, event: String, status: String, pid: Int?, tty: String?, tool: String?, toolInput: [String: AnyCodable]?, toolUseId: String?, notificationType: String?, message: String?) {
+    init(sessionId: String, cwd: String, event: String, status: String, pid: Int?, tty: String?, tool: String?, toolInput: [String: AnyCodable]?, toolUseId: String?, notificationType: String?, message: String?, agent: String?) {
         self.sessionId = sessionId
         self.cwd = cwd
         self.event = event
@@ -48,6 +58,7 @@ struct HookEvent: Codable, Sendable {
         self.toolUseId = toolUseId
         self.notificationType = notificationType
         self.message = message
+        self.agent = agent
     }
 
     var sessionPhase: SessionPhase {
@@ -447,7 +458,8 @@ class HookSocketServer {
                 toolInput: event.toolInput,
                 toolUseId: toolUseId,  // Use resolved toolUseId
                 notificationType: event.notificationType,
-                message: event.message
+                message: event.message,
+                agent: event.agent
             )
 
             let pending = PendingPermission(

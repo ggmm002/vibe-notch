@@ -52,19 +52,47 @@ struct TerminalAppRegistry: Sendable {
         "dev.zed.Zed"
     ]
 
-    /// Check if an app name or command path is a known terminal
+    /// Check if an app name or command path is a known terminal.
+    ///
+    /// Matching is word-boundary aware, not a plain substring test: the OpenAI
+    /// Codex CLI's executable is `codex`, and a plain `contains("code")` (from
+    /// the "Code" / VS Code entry) falsely flagged it as a terminal — which
+    /// stopped the process-tree walk at the `codex` process instead of the
+    /// real terminal app hosting it.
     static func isTerminal(_ appNameOrCommand: String) -> Bool {
-        let lower = appNameOrCommand.lowercased()
-
-        // Check if any known app name is contained in the command (case-insensitive)
         for name in appNames {
-            if lower.contains(name.lowercased()) {
+            if containsWord(appNameOrCommand, name) {
                 return true
             }
         }
+        return containsWord(appNameOrCommand, "terminal")
+            || containsWord(appNameOrCommand, "iterm")
+    }
 
-        // Additional checks for common patterns
-        return lower.contains("terminal") || lower.contains("iterm")
+    /// Case-insensitive search for `word` in `haystack` bounded by non-alphanumeric
+    /// characters (or string ends), so `code` matches `Code.app` but not `codex`.
+    private static func containsWord(_ haystack: String, _ word: String) -> Bool {
+        guard !word.isEmpty else { return false }
+        var searchStart = haystack.startIndex
+        while let range = haystack.range(
+            of: word,
+            options: [.caseInsensitive],
+            range: searchStart..<haystack.endIndex
+        ) {
+            let beforeOK = range.lowerBound == haystack.startIndex
+                || !isWordChar(haystack[haystack.index(before: range.lowerBound)])
+            let afterOK = range.upperBound == haystack.endIndex
+                || !isWordChar(haystack[range.upperBound])
+            if beforeOK && afterOK {
+                return true
+            }
+            searchStart = range.upperBound
+        }
+        return false
+    }
+
+    private static func isWordChar(_ character: Character) -> Bool {
+        character.isLetter || character.isNumber
     }
 
     /// Check if a bundle identifier is a known terminal

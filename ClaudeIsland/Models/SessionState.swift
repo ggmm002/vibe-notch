@@ -23,6 +23,9 @@ struct SessionState: Equatable, Identifiable, Sendable {
     var tty: String?
     var isInTmux: Bool
 
+    /// Which CLI agent owns this session. Defaults to `.claude`.
+    var agentType: AgentType
+
     // MARK: - State Machine
 
     /// Current phase in the session lifecycle
@@ -71,6 +74,7 @@ struct SessionState: Equatable, Identifiable, Sendable {
         pid: Int? = nil,
         tty: String? = nil,
         isInTmux: Bool = false,
+        agentType: AgentType = .claude,
         phase: SessionPhase = .idle,
         chatItems: [ChatHistoryItem] = [],
         toolTracker: ToolTracker = ToolTracker(),
@@ -89,6 +93,7 @@ struct SessionState: Equatable, Identifiable, Sendable {
         self.pid = pid
         self.tty = tty
         self.isInTmux = isInTmux
+        self.agentType = agentType
         self.phase = phase
         self.chatItems = chatItems
         self.toolTracker = toolTracker

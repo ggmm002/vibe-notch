@@ -122,6 +122,13 @@ actor SessionStore {
     // MARK: - Hook Event Processing
 
     private func processHookEvent(_ event: HookEvent) async {
+        // Runtime isolation: ignore Codex events entirely when Codex monitoring
+        // is disabled, even if a stale codex-hook.py is still installed. This
+        // makes the feature flag a hard guarantee, not just an install-time one.
+        if event.agentType == .codex && !AppSettings.codexMonitoringEnabled {
+            return
+        }
+
         let sessionId = event.sessionId
         let isNewSession = sessions[sessionId] == nil
         var session = sessions[sessionId] ?? createSession(from: event)
@@ -167,11 +174,42 @@ actor SessionStore {
             session.subagentState = SubagentState()
         }
 
+        if session.agentType == .codex {
+            appendCodexHookMessages(event: event, session: &session)
+        }
+
         sessions[sessionId] = session
         publishState()
 
-        if event.shouldSyncFile {
+        // Codex has no Claude-format JSONL — its chat history is reconstructed
+        // from hook events, so it never schedules a JSONL file sync.
+        if session.agentType != .codex && event.shouldSyncFile {
             scheduleFileSync(sessionId: sessionId, cwd: event.cwd)
+        }
+    }
+
+    /// Reconstruct chat history for a Codex session from hook events. Tool calls
+    /// are already materialized by processToolTracking; this adds the user
+    /// prompt and the assistant's reply for each turn. Lower fidelity than JSONL
+    /// parsing (no streaming text / thinking blocks) — see codex-mvp-plan.md.
+    private func appendCodexHookMessages(event: HookEvent, session: inout SessionState) {
+        switch event.event {
+        case "UserPromptSubmit":
+            guard let text = event.message, !text.isEmpty else { return }
+            session.chatItems.append(ChatHistoryItem(
+                id: "codex-user-\(UUID().uuidString)",
+                type: .user(text),
+                timestamp: Date()
+            ))
+        case "Stop":
+            guard let text = event.message, !text.isEmpty else { return }
+            session.chatItems.append(ChatHistoryItem(
+                id: "codex-assistant-\(UUID().uuidString)",
+                type: .assistant(text),
+                timestamp: Date()
+            ))
+        default:
+            break
         }
     }
 
@@ -183,6 +221,7 @@ actor SessionStore {
             pid: event.pid,
             tty: event.tty?.replacingOccurrences(of: "/dev/", with: ""),
             isInTmux: false,  // Will be updated
+            agentType: event.agentType,
             phase: .idle
         )
     }
@@ -242,6 +281,12 @@ actor SessionStore {
                        case .toolCall(var tool) = session.chatItems[i].type,
                        tool.status == .waitingForApproval || tool.status == .running {
                         tool.status = .success
+                        // Codex carries the tool result on the PostToolUse hook;
+                        // Claude fills this in later from JSONL instead.
+                        if event.agentType == .codex,
+                           let response = event.message, !response.isEmpty {
+                            tool.result = response
+                        }
                         session.chatItems[i] = ChatHistoryItem(
                             id: toolUseId,
                             type: .toolCall(tool),
@@ -933,6 +978,10 @@ actor SessionStore {
     // MARK: - History Loading
 
     private func loadHistoryFromFile(sessionId: String, cwd: String) async {
+        // Codex sessions have no Claude-format JSONL; their history is built
+        // incrementally from hook events in appendCodexHookMessages.
+        if sessions[sessionId]?.agentType == .codex { return }
+
         // Parse file asynchronously
         let messages = await ConversationParser.shared.parseFullConversation(
             sessionId: sessionId,
@@ -1098,7 +1147,7 @@ actor SessionStore {
             default:
                 needsSync = false
             }
-            if needsSync {
+            if needsSync && session.agentType != .codex {
                 scheduleFileSync(sessionId: sessionId, cwd: session.cwd)
             }
         }
