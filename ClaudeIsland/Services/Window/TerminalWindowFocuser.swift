@@ -6,15 +6,13 @@
 //  using native macOS APIs only — works for Ghostty, Terminal, iTerm2, Warp,
 //  WezTerm, Alacritty, etc. No dependency on yabai or tmux.
 //
-//  Bringing another app's window forward from an accessory (LSUIElement) app
-//  is unreliable with NSRunningApplication.activate alone, so we drive it
-//  through the Accessibility API:
-//    1. NSRunningApplication.activate() — best-effort app activation.
-//    2. AX kAXFrontmostAttribute on the app element — the part that actually
-//       brings the app forward from a background process.
-//    3. AX kAXRaiseAction on the matching window (by title), falling back to
-//       the app's main/focused window so a click always surfaces *something*.
-//  Steps 2–3 require the user to grant Accessibility permission once.
+//  Bringing a specific window of another app forward from an accessory
+//  (LSUIElement) app is done through the Accessibility API:
+//    1. Enumerate the terminal app's AX windows.
+//    2. Pick the window whose title uniquely identifies this session.
+//    3. Raise + focus that window, then NSRunningApplication.activate() so the
+//       raised window becomes key.
+//  Steps 1–3 require the user to grant Accessibility permission once.
 //
 
 import AppKit
@@ -28,12 +26,11 @@ final class TerminalWindowFocuser {
     static let shared = TerminalWindowFocuser()
 
     /// Have we already shown the Accessibility prompt this session?
-    /// We only prompt once so we don't spam the user.
     private var didRequestAccessibility = false
 
     private init() {}
 
-    /// Bring the terminal hosting this session to the front.
+    /// Bring the terminal window hosting this session to the front.
     /// - Returns: true if a terminal app was resolved and activation attempted.
     @discardableResult
     func focus(session: SessionState) -> Bool {
@@ -47,14 +44,12 @@ final class TerminalWindowFocuser {
             return false
         }
 
-        // Modern activation API. `.activateIgnoringOtherApps` was deprecated in
-        // macOS 14 and is unreliable when called from an accessory app.
-        app.activate()
-        logger.info("Activating terminal pid=\(terminalPid) (\(app.localizedName ?? "?", privacy: .public)) for session \(session.sessionId.prefix(8), privacy: .public)")
-
-        // Raise the specific window via Accessibility — this is what actually
-        // surfaces the right window; app activation alone often does nothing.
+        // Raise the specific window first (Accessibility), then activate the
+        // app so the just-raised window becomes key. `.activateIgnoringOtherApps`
+        // was deprecated in macOS 14 and is unreliable from an accessory app.
         raiseWindow(appPid: terminalPid, session: session)
+        app.activate()
+        logger.info("Activated terminal pid=\(terminalPid) (\(app.localizedName ?? "?", privacy: .public)) for session \(session.sessionId.prefix(8), privacy: .public)")
 
         return true
     }
@@ -74,7 +69,6 @@ final class TerminalWindowFocuser {
             }
         }
 
-        // Fallback: any running terminal — caller may at least get *a* terminal forward
         for app in NSWorkspace.shared.runningApplications {
             if let bundleId = app.bundleIdentifier,
                TerminalAppRegistry.isTerminalBundle(bundleId) {
@@ -95,10 +89,6 @@ final class TerminalWindowFocuser {
 
         let appElement = AXUIElementCreateApplication(pid_t(appPid))
 
-        // Bring the app forward at the AX level. Reliable from a background app
-        // in a way NSRunningApplication.activate() is not.
-        AXUIElementSetAttributeValue(appElement, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
-
         var windowsRef: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(
             appElement,
@@ -110,26 +100,30 @@ final class TerminalWindowFocuser {
             return
         }
 
-        // Prefer the window whose title matches this session.
-        if let matched = matchWindow(in: windows, session: session) {
-            raise(matched)
-            logger.info("Raised matching window for session \(session.sessionId.prefix(8), privacy: .public)")
+        guard let target = matchWindow(in: windows, session: session) else {
+            // Deliberately raise nothing when we can't uniquely identify the
+            // window — raising an arbitrary one yanks the user to an unrelated
+            // session. App activation in focus() still brings the app forward.
+            logger.warning("No unique window match for session \(session.sessionId.prefix(8), privacy: .public)")
             return
         }
 
-        // No title match — surface the app's main/focused window, or the first
-        // window. The user clicked "go to terminal" and expects *a* window to
-        // come forward; raising none (the old behavior) looked like a no-op.
-        if let fallback = focusedOrMainWindow(of: appElement) ?? windows.first {
-            raise(fallback)
-            logger.info("No title match — raised main/first window for session \(session.sessionId.prefix(8), privacy: .public)")
-        }
+        AXUIElementSetAttributeValue(appElement, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(target, kAXMainAttribute as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(target, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        AXUIElementPerformAction(target, kAXRaiseAction as CFString)
+        logger.info("Raised window for session \(session.sessionId.prefix(8), privacy: .public)")
     }
 
-    /// Find the window whose title contains a session-identifying substring.
-    /// Claude Code writes the session summary / first user message into the
-    /// terminal window title via OSC 2; cwd basename is the last-ditch hint.
+    /// Find the AX window that uniquely identifies this session by title.
+    ///
+    /// Claude Code / Codex write a session identifier into the terminal window
+    /// title (via OSC 2). Titles are often truncated, so matching is done in
+    /// both directions and a candidate is only accepted when it matches exactly
+    /// one window — never guess between same-titled windows.
     private func matchWindow(in windows: [AXUIElement], session: SessionState) -> AXUIElement? {
+        // Most-specific first. cwd basename is last: every session in the same
+        // project shares it, so it only helps when it isolates one window.
         let candidates: [String] = [
             session.summary,
             session.firstUserMessage,
@@ -137,43 +131,53 @@ final class TerminalWindowFocuser {
             URL(fileURLWithPath: session.cwd).lastPathComponent,
         ]
         .compactMap { $0 }
-        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        .filter { !$0.isEmpty }
+        .map { normalize($0) }
+        .filter { $0.count >= 4 }
 
-        guard !candidates.isEmpty else { return nil }
-
-        let titledWindows: [(AXUIElement, String)] = windows.compactMap { window in
-            guard let title = axTitle(of: window) else { return nil }
-            return (window, title)
+        let titled: [(window: AXUIElement, title: String)] = windows.compactMap { window in
+            guard let raw = axTitle(of: window) else { return nil }
+            let cleaned = normalize(stripLeadingGlyphs(raw))
+            guard !cleaned.isEmpty else { return nil }
+            return (window, cleaned)
         }
+        guard !titled.isEmpty else { return nil }
 
         for candidate in candidates {
-            // Window titles often carry a spinner glyph prefix the session
-            // metadata doesn't have; substring matching tolerates that. Cap the
-            // needle so we don't fail when Claude truncates a long title.
-            let needle = String(candidate.prefix(50))
-            for (window, title) in titledWindows where title.contains(needle) {
-                return window
+            let hits = titled.filter { titlesOverlap($0.title, candidate) }
+            if hits.count == 1 {
+                return hits[0].window
             }
         }
         return nil
     }
 
-    /// The app's main window, or its focused window, if either is exposed.
-    private func focusedOrMainWindow(of appElement: AXUIElement) -> AXUIElement? {
-        for attribute in [kAXMainWindowAttribute, kAXFocusedWindowAttribute] {
-            var ref: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(appElement, attribute as CFString, &ref) == .success,
-                  let value = ref,
-                  CFGetTypeID(value) == AXUIElementGetTypeID() else { continue }
-            return (value as! AXUIElement)
-        }
-        return nil
+    /// True when two normalized strings plausibly name the same session,
+    /// tolerating the title truncation terminals apply.
+    private func titlesOverlap(_ a: String, _ b: String) -> Bool {
+        if a == b { return true }
+        let shorter = a.count <= b.count ? a : b
+        let longer = a.count <= b.count ? b : a
+        guard shorter.count >= 4 else { return false }
+        return longer.hasPrefix(shorter) || longer.contains(shorter)
     }
 
-    private func raise(_ window: AXUIElement) {
-        AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
-        AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    /// Lowercase + collapse runs of whitespace, so titles and metadata compare
+    /// cleanly regardless of spacing.
+    private func normalize(_ string: String) -> String {
+        string.lowercased()
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    /// Drop leading non-alphanumeric characters — terminal titles carry a
+    /// spinner glyph prefix ("✳ ", "⠙ ") that session metadata doesn't have.
+    private func stripLeadingGlyphs(_ string: String) -> String {
+        var chars = Substring(string)
+        while let first = chars.first, !first.isLetter, !first.isNumber {
+            chars = chars.dropFirst()
+        }
+        return String(chars)
     }
 
     /// Returns whether Accessibility is granted, prompting once per app session.

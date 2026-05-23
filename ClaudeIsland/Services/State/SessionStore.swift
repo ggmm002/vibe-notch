@@ -196,11 +196,25 @@ actor SessionStore {
         switch event.event {
         case "UserPromptSubmit":
             guard let text = event.message, !text.isEmpty else { return }
+            let now = Date()
             session.chatItems.append(ChatHistoryItem(
                 id: "codex-user-\(UUID().uuidString)",
                 type: .user(text),
-                timestamp: Date()
+                timestamp: now
             ))
+            // Populate conversationInfo so the session row shows the prompt
+            // instead of falling back to cwd basename (often the user's home).
+            // The first prompt also drives displayTitle when there's no summary.
+            let prior = session.conversationInfo
+            session.conversationInfo = ConversationInfo(
+                summary: prior.summary,
+                lastMessage: text,
+                lastMessageRole: "user",
+                lastToolName: nil,
+                firstUserMessage: prior.firstUserMessage ?? text,
+                lastUserMessageDate: now,
+                usage: prior.usage
+            )
         case "Stop":
             guard let text = event.message, !text.isEmpty else { return }
             session.chatItems.append(ChatHistoryItem(
@@ -208,6 +222,16 @@ actor SessionStore {
                 type: .assistant(text),
                 timestamp: Date()
             ))
+            let prior = session.conversationInfo
+            session.conversationInfo = ConversationInfo(
+                summary: prior.summary,
+                lastMessage: text,
+                lastMessageRole: "assistant",
+                lastToolName: nil,
+                firstUserMessage: prior.firstUserMessage,
+                lastUserMessageDate: prior.lastUserMessageDate,
+                usage: prior.usage
+            )
         default:
             break
         }
